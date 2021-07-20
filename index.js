@@ -61,24 +61,24 @@ calendars.get().then((c) => {
 	};
 });
 
-db.collection("units").get().then((c) => {
+units.get().then((c) => {
 	const batch = db.batch();
 
 	if (c.empty) {
 		unit_data.forEach((doc) => {
-			const docRef = db.collection("units").doc(doc.id);
+			const docRef = units.doc(doc.id);
 			batch.set(docRef, doc);
 		});
 		batch.commit();
 	};
 });
 
-db.collection("sections").get().then((c) => {
+sections.get().then((c) => {
 	const batch = db.batch();
 
 	if (c.empty) {
 		section_data.forEach((doc) => {
-			const docRef = db.collection("sections").doc(doc.id);
+			const docRef = sections.doc(doc.id);
 			batch.set(docRef, doc);
 		});
 		batch.commit();
