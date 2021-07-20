@@ -16,57 +16,110 @@ app.listen(port, function () {
 	console.log(`Open http://localhost:${port} in browser`);
 });
 
-const Datastore = require("nedb");
+const firebase = require("firebase");
 
-const db = new Datastore();
-db.insert(require("./data.json"));
+firebase.initializeApp({
+	//apiKey: "YOUR_API_KEY",
+	//sample db, full read/write access (test mode)
+	projectId: "scheduler-4f169"
+});
 
-const cb = new Datastore();
-cb.insert(require("./calendars.json"));
+const db = firebase.firestore(); 
 
-const ub = new Datastore();
-ub.insert(require("./units.json"));
+const event_data = require("./data.json");
+const calendar_data = require("./calendars.json");
+const unit_data = require("./units.json");
+const section_data = require("./sections.json");
 
-const rb = new Datastore();
-rb.insert(require("./sections.json"));
+const events = db.collection("events");
+const calendars = db.collection("calendars");
+const units = db.collection("units");
+const sections = db.collection("sections");
 
-// client side expects obj.id while DB provides obj._id
-function fixID(a){
-	a.id = a._id;
-	delete a._id;
-	return a;
-}
+//populate firestore with default data (if empty)
+events.get().then((c) => {
+	const batch = db.batch();
+
+	if (c.empty) {
+		event_data.forEach((doc) => {
+			const docRef = events.doc(doc.id);
+			batch.set(docRef, doc);
+		});
+		batch.commit();
+	};
+});
+
+calendars.get().then((c) => {
+	const batch = db.batch();
+
+	if (c.empty) {
+		calendar_data.forEach((doc) => {
+			const docRef = calendars.doc(doc.id);
+			batch.set(docRef, doc);
+		});
+		batch.commit();
+	};
+});
+
+db.collection("units").get().then((c) => {
+	const batch = db.batch();
+
+	if (c.empty) {
+		unit_data.forEach((doc) => {
+			const docRef = db.collection("units").doc(doc.id);
+			batch.set(docRef, doc);
+		});
+		batch.commit();
+	};
+});
+
+db.collection("sections").get().then((c) => {
+	const batch = db.batch();
+
+	if (c.empty) {
+		section_data.forEach((doc) => {
+			const docRef = db.collection("sections").doc(doc.id);
+			batch.set(docRef, doc);
+		});
+		batch.commit();
+	};
+});
 
 app.get("/events", (req, res, next) => {
 	const from = req.query.from;
 	const to = req.query.to;
 
 	if (from && to) {
-		db.find({
-			start_date:{ $lt: req.query.to },
-			$or:[
-				{ end_date:{ $gte: req.query.from } },
-				{ series_end_date:{ $gte: req.query.from } },
-				{ 
-					$and:[
-						{ $not: { recurring: "" } },
-						{ series_end_date: "" }
-					]
-				}
-			]
-		}).sort({ start_date: 1 }).exec((err, data) => {
-			if (err)
-			    next(err);
-			else {
-				res.send(data.map(fixID));
-			}
+		const q = events.where("start_date", "<", req.query.to).get();
+		
+		const sq1 = events.where("end_date", ">=", req.query.from).get();
+		const sq2 = events.where("series_end_date", ">=", req.query.from).get();
+		//compound queries require composite indices in the firestore
+		const sq3 = events.where("recurring", "!=", "").where("series_end_date", "==", "").get();
+
+		Promise.all([q, sq1, sq2, sq3])
+		.then((data) => {
+			let evs = [];
+
+			if (data[0].size && (data[1].size || data[2].size || data[3].size)) {
+
+				data.forEach((qs) => {
+					evs = evs.concat(qs.docs.map(doc => doc.data()));
+				});
+			};
+
+			res.send(evs);
+		})
+		.catch((err) => {
+			next(err);
 		});
 	} else {
-		db.find({}).sort({ start_date: 1 }).exec((err, data) => {
-			if (err)
-				next(err);
-			else
-				res.send(data.map(fixID));
+		events.orderBy("start_date", "asc").get()
+		.then((data) => {
+			res.send(data.docs.map(doc => doc.data()));
+		})
+		.catch((err) => {
+			next(err);
 		});
 	}
 });
@@ -88,22 +141,25 @@ const allowedFields = [
 
 app.put("/events/:id", (req, res, next) => {
 	const event = {};
-	for (f in req.body){
+	for (let f in req.body){
 		if (allowedFields.indexOf(f) !== -1) event[f] = req.body[f];
 	}
 
-	db.update({ _id: req.params.id }, { $set: event }, {}, (err, data) => {
-		if (err)
-			next(err);
-		else {
-			const mode = req.body.recurring_update_mode;
+	events.doc(req.params.id).update(req.body)
+	.then(() => {
+		const mode = req.body.recurring_update_mode;
 			if (mode === "all"){
 				// remove all sub-events
-				db.remove({ origin_id: req.params.id }, { multi: true }, (err, data) => {
-					if (err)
-						next(err);
-					else
-						res.send({});
+				events.where("origin_id", "==", req.params.id).get()
+				.then((qs) => {
+					qs.forEach((doc) => {
+						events.doc(doc.id).delete();
+					});
+		
+					res.send({});
+				})
+				.catch((err) => {
+					next(err);
 				});
 			} else if (mode === "next"){
 				// remove all sub-events after new 'this and next' group
@@ -112,117 +168,146 @@ app.put("/events/:id", (req, res, next) => {
 					next("date must be provided");
 				} else {
 					// in case update came for a subevent, search the master event
-					db.find({ _id: req.params.id, origin_id:{ $ne: "0" }}, (err, data) => {
-						if (err){
+
+					events.where("id", "==", req.params.id).where("origin_id", "!=", "0").get()
+					.then((qs) => {
+						let id = req.params.id;
+
+						if (!qs.empty) {
+							qs = qs.docs.map(doc => doc.data());
+							id = qs[0].origin_id;
+						};
+
+						events.where("origin_id", "==", id).where("start_date", ">=", date).get()
+						.then((qs_) => {
+
+							qs_.forEach((doc) => {
+								events.doc(doc.id).delete();
+							});
+				
+							res.send({});
+						})
+						.catch((err) => {
 							next(err);
-						} else {
-							let id = req.params.id;
-							if (data.length){
-								id = data[0].origin_id;
-							}
-							db.remove({ origin_id: id, start_date: { $gte: date }}, { multi: true }, (err, data) => {
-								if (err)
-									next(err);
-								else
-									res.send({});
-							})
-						}
+						});
+					}).catch((err) => {
+						next(err);
 					});
+
 				}
 			} else {
 				res.send({});
 			}
-		}
+	})
+	.catch((err) => {
+		next(err);
 	});
+
 });
 
 app.delete("/events/:id", (req, res, next) => {
-	db.remove({ _id: req.params.id }, {}, (err, data) => {
-		if (err)
-			next(err);
-		else {
-			// remove all subevents
-			db.remove({ origin_id: req.params.id }, { multi: true }, (err, data) => {
-				if (err)
-					next(err);
-				else
-					res.send({});
+	events.doc(req.params.id).delete()
+	.then(() => {
+		events.where("origin_id", "==", req.params.id).get()
+		.then((qs) => {
+			qs.forEach((doc) => {
+				events.doc(doc.id).delete();
 			});
-		}
+
+			res.send({});
+		});
+	})
+	.catch((err) => {
+		next(err);
 	});
 });
 
 app.post("/events", (req, res, next) => {
 	const event = {};
-	for (f in req.body){
+	for (let f in req.body){
 		if (allowedFields.indexOf(f) !== -1) event[f] = req.body[f];
 	}
 
-	db.insert(event, (err, data) => {
-		if (err) 
-			next(err);
-		else
-			res.send({ id: fixID(data).id });
+	const doc = events.doc();
+	event.id = doc.id;
+
+	doc.set(event)
+	.then(() => {
+		res.send({ id: doc.id });
+	})
+	.catch((err) => {
+		next(err);
 	});
+
 });
 
 app.get("/calendars", (req, res, next) => {
-	cb.find({}).sort({ order: 1 }).exec((err, data) => {
-	if (err)
+	calendars.get()
+	.then((data) => {
+		res.send(data.docs.map(doc => doc.data()));
+	})
+	.catch((err) => {
 		next(err);
-	else
-		res.send(data.map(fixID));
 	});
 });
 
 app.put("/calendars/:id", (req, res, next) => {
-	cb.update({ _id: req.params.id }, { $set: req.body }, {}, (err, data) => {
-		if (err)
-			next(err);
-		else
-			res.send({});
+	calendars.doc(req.params.id).update(req.body)
+	.then(() => {
+		res.send({});
+	})
+	.catch((err) => {
+		next(err);
 	});
 });
 
 app.delete("/calendars/:id", (req, res, next) => {
-	cb.remove({ _id: req.params.id }, {}, (err, data) => {
-		if (err)
-			next(err);
-		else {
-			// remove all events from that calendar
-			db.remove({ calendar: req.params.id }, { multi: true }, (err, data) => {
-				if (err)
-					next(err);
-				else 
-					res.send({});
+	calendars.doc(req.params.id).delete()
+	.then(() => {
+		events.where("calendar", "==", req.params.id).get()
+		.then((qs) => {
+			qs.forEach((doc) => {
+				events.doc(doc.id).delete();
 			});
-		}
+
+			res.send({});
+		});
+	})
+	.catch((err) => {
+		next(err);
 	});
 });
 
 app.post("/calendars", (req, res, next) => {
-	cb.insert(req.body, (err, data) => {
-		if (err) 
-			next(err);
-		else
-			res.send({ id: fixID(data).id });
+	const cal = req.body;
+	const doc = calendars.doc();
+	cal.id = doc.id;
+
+	doc.set(cal)
+	.then(() => {
+		res.send({ id: doc.id });
+	})
+	.catch((err) => {
+		next(err);
 	});
 });
 
 app.get("/units", (req, res, next) => {
-	ub.find({}).sort({ order: 1 }).exec((err, data) => {
-	if (err)
+	units.get()
+	.then((data) => {
+		res.send(data.docs.map(doc => doc.data()));
+	})
+	.catch((err) => {
 		next(err);
-	else
-		res.send(data.map(fixID));
 	});
 });
 
 app.get("/sections", (req, res, next) => {
-	rb.find({}).exec((err, data) => {
-	if (err)
+	sections.get()
+	.then((data) => {
+		res.send(data.docs.map(doc => doc.data()));
+	})
+	.catch((err) => {
 		next(err);
-	else
-		res.send(data.map(fixID));
 	});
 });
